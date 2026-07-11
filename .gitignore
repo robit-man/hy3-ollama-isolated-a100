@@ -1,0 +1,7 @@
+node_modules/
+.omnius/
+.vscode/
+.DS_Store
+*.log
+*.tmp
+omnius-nextjs-geospatial/node_modules/
