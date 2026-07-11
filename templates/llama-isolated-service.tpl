@@ -12,6 +12,7 @@ WorkingDirectory=%h/Documents/Projects/Adjacent/hy3
 ExecStart=%h/Documents/Projects/Adjacent/hy3/run_hy3_entrypoint.sh foreground
 Restart=always
 RestartSec=5
+TimeoutStopSec=300
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal

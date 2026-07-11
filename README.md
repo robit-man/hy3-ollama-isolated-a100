@@ -178,3 +178,54 @@ visible, model load without CPU fallback, no unified-memory spill, and a
 successful completion with measured tokens per second.
 
 Keep model files, logs, .omnius state, and downloaded blobs out of git.
+
+## End-to-end capability-aware installation
+
+Use the installer from the target user's login session. It is intentionally
+not a root script because it installs a user systemd service for that account.
+The default flow:
+
+- detects the OS, CUDA toolkit, NVIDIA driver, A100 count, VRAM, topology,
+  NCCL, systemd user state, linger, model filesystem, and endpoint conflicts;
+- installs missing Ubuntu build dependencies when apt and sudo are available;
+- optionally installs NCCL if the configured NVIDIA apt repository provides it;
+- refuses to deploy the default profile unless at least three A100s are found;
+- pulls the selected GGUF only when it is absent and checks disk headroom first;
+- builds the custom Hy3 branch with CUDA 80 and reports whether NCCL was really
+  found by CMake;
+- generates the service with the detected physical A100 ids, not a hardcoded
+  assumption that the cards are GPUs 0, 1, and 2;
+- restarts only the named user service, waits for /health, verifies the
+  reported context window, runs a completion, and records GPU residency.
+
+Run a read-only plan first:
+
+    ./scripts/install_hy3.sh --dry-run --no-build --no-pull
+
+Install or reconcile the current Q2_K deployment:
+
+    ./scripts/install_hy3.sh --enable-linger
+
+The installer writes host-specific state outside the repository:
+
+- $XDG_STATE_HOME/hy3/capabilities.json
+- $XDG_STATE_HOME/hy3/capabilities.md
+- $XDG_STATE_HOME/hy3/nvidia-topology.txt
+- $XDG_STATE_HOME/hy3/install.manifest
+
+Useful overrides:
+
+    ./scripts/install_hy3.sh --class MTP-IQ2_M
+    ./scripts/install_hy3.sh --context 131072
+    ./scripts/install_hy3.sh --no-system-packages --no-build --no-pull
+    ./scripts/install_hy3.sh --install-nccl --require-nccl
+
+NCCL is not required for the default layer-split service. It is required only
+when selecting a tensor-parallel profile; if the host package repository does
+not provide libnccl-dev, install the matching NVIDIA CUDA repository package
+before using --require-nccl. The installer never treats the CMake option being
+enabled as proof that NCCL was actually found.
+
+The generated service gives a live request up to five minutes to drain during
+an intentional restart. This prevents a long Omnius request from being
+SIGKILLed merely because the model is still finishing a completion.

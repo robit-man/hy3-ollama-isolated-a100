@@ -9,6 +9,8 @@ LLAMA_CPP_BRANCH="${LLAMA_CPP_BRANCH:-hy3-mtp}"
 BUILD_DIR="${LLAMA_BUILD_DIR:-${LLAMA_CPP_DIR}/build}"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 UPDATE_SOURCE="${UPDATE_SOURCE:-0}"
+CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-80}"
+REQUIRE_NCCL="${REQUIRE_NCCL:-0}"
 
 if ! command -v cmake >/dev/null 2>&1; then
   echo "ERROR: cmake is required"
@@ -39,7 +41,7 @@ cmake -S "$LLAMA_CPP_DIR" -B "$BUILD_DIR" \
   -DGGML_CUDA_NCCL=ON \
   -DGGML_CUDA_FA_ALL_QUANTS=ON \
   -DGGML_CUDA_GRAPHS=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=80 \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build "$BUILD_DIR" --target llama-server llama-bench -j"$BUILD_JOBS"
@@ -53,11 +55,21 @@ if ! rg -q '^GGML_CUDA_NCCL:BOOL=ON$' "${BUILD_DIR}/CMakeCache.txt"; then
   exit 1
 fi
 
+NCCL_STATUS=available
+if rg -q 'NCCL_(LIBRARY|INCLUDE_DIR):.*NOTFOUND' "${BUILD_DIR}/CMakeCache.txt"; then
+  NCCL_STATUS=missing
+fi
+if [[ "$REQUIRE_NCCL" == "1" && "$NCCL_STATUS" != "available" ]]; then
+  echo "ERROR: NCCL was required but CMake could not find its library and headers"
+  exit 1
+fi
+
 echo "Hy3 llama.cpp build ready:"
 echo "  source: ${LLAMA_CPP_DIR}"
 echo "  branch: ${LLAMA_CPP_BRANCH}"
 echo "  server: ${BUILD_DIR}/bin/llama-server"
 echo "  bench: ${BUILD_DIR}/bin/llama-bench"
 echo "  FA_ALL_QUANTS: ON"
-echo "  NCCL: ON"
-echo "  CUDA architecture: 80"
+echo "  NCCL option: ON"
+echo "  NCCL detected: ${NCCL_STATUS}"
+echo "  CUDA architecture: ${CUDA_ARCHITECTURES}"
