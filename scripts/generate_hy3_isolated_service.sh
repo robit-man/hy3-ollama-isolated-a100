@@ -36,6 +36,8 @@ EOF2
 cat > "$UNIT_FILE" <<EOF2
 [Unit]
 Description=Hy3 isolated Ollama endpoint (${SERVICE_NAME})
+StartLimitIntervalSec=60
+StartLimitBurst=10
 After=network-online.target
 Wants=network-online.target
 
@@ -45,8 +47,6 @@ EnvironmentFile=%h/.config/hy3/${SERVICE_NAME}.env
 ExecStart=${OLLAMA_BIN} serve
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=10
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal

@@ -2,73 +2,100 @@
 
 This repo contains scripts to:
 - pull Hy3 GGUF weights from Hugging Face,
-- configure an isolated local Ollama endpoint,
-- generate/run a systemd user service,
+- configure isolated local endpoints,
+- generate/run systemd user services,
 - and tune Hy3 inference for a 3×A100 hybrid setup.
 
 ## Files
 
 - `deploy_hy3.sh`
-  - Existing script that starts an ephemeral Ollama serve and pulls `hf.co/satgeze/Hy3-1M-GGUF:<class>`.
+  - Existing script that starts a dedicated official Ollama `ollama serve` instance and pulls `hf.co/satgeze/Hy3-1M-GGUF:<class>`.
 - `run_hy3_entrypoint.sh`
-  - Existing `llama-server` launcher for hybrid CPU+GPU execution.
+  - Existing direct `llama-server` launcher for hybrid CPU+GPU execution.
 - `scripts/pull_hy3_gguf.sh`
-  - Automatic download script for `/srv/hy3/hy3-1M-*.gguf`.
+  - Automatic Hy3 download script for `/srv/hy3/hy3-1M-*.gguf`.
 - `scripts/generate_hy3_isolated_service.sh`
-  - Generates a systemd user service file for an isolated Ollama endpoint.
+  - Generates a **user-level systemd** service for a dedicated **Ollama** endpoint.
 - `scripts/deploy_hy3_isolated.sh`
-  - End-to-end local deploy: ensure model, generate service, enable/start, readiness check.
+  - Runs model pull + service generation + start + readiness check for the Ollama endpoint.
+- `scripts/generate_hy3_llama_service.sh`
+  - Generates a **user-level systemd** service for a dedicated **llama-server** endpoint.
+- `scripts/deploy_hy3_llama_isolated.sh`
+  - Runs model pull + service generation + start + readiness check for the llama-server endpoint.
 - `configs/hy3-a100-hybrid.env`
-  - Strong default tuning profile for 3×A100 with llama-server.
+  - Strong default tuning profile for 3×A100 with hybrid GPU/CPU execution.
 - `templates/ollama-isolated-service.tpl`
   - Template for the Ollama systemd unit.
+- `templates/llama-isolated-service.tpl`
+  - Template for llama-server unit generation.
 - `scripts/publish_to_github.sh`
   - Convenience publish script.
 
-## Quickstart: pull and run new isolated endpoint
-
-1. Pull/update the model weights:
-
-```bash
-HY3_MODELS_DIR=/srv/hy3 ./scripts/pull_hy3_gguf.sh 0
-```
-
-2. Deploy and start an isolated endpoint on `127.0.0.1:11452`:
+## Quickstart A: dedicated Ollama endpoint (fastest to consume)
 
 ```bash
 HY3_MODELS_DIR=/srv/hy3 \
 HY3_CLASS=Q2_K \
-HY3_SERVICE_NAME=hy3-isolated \
+HY3_SERVICE_NAME=hy3-ollama-isolated \
 HY3_PORT=11452 \
 /home/roko/Documents/Projects/Adjacent/hy3/scripts/deploy_hy3_isolated.sh
 ```
 
-3. Verify:
+Verify with:
 
 ```bash
 curl -sS http://127.0.0.1:11452/api/tags | jq
 ```
 
-4. Hit it from Omnius or apps (OpenAI-compatible path):
+## Quickstart B: dedicated llama-server endpoint (recommended for hy3-1M architecture support)
 
 ```bash
-curl -sS http://127.0.0.1:11452/v1/models
+HY3_MODELS_DIR=/srv/hy3 \
+HY3_CLASS=Q2_K \
+CTX_SIZE=262000 \
+SPLIT_MODE=layer \
+N_GPU_LAYERS=81 \
+PARALLEL=8 \
+THREADS_BATCH=32 \
+POLL_BATCH=1 \
+CONT_BATCHING=1 \
+CACHE_TYPE_K=q8_0 \
+CACHE_TYPE_V=q8_0 \
+HY3_SERVICE_NAME=hy3-llama-isolated \
+HY3_PORT=11453 \
+/home/roko/Documents/Projects/Adjacent/hy3/scripts/deploy_hy3_llama_isolated.sh
+```
+
+Verify with:
+
+```bash
+curl -sS http://127.0.0.1:11453/v1/models
+curl -sS -X POST http://127.0.0.1:11453/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/srv/hy3/hy3-1M-Q2_K.gguf","prompt":"say hello","max_tokens":12}'
 ```
 
 ## A100 + hybrid tuning (`configs/hy3-a100-hybrid.env`)
 
-- Uses:
-  - `GPU_DEVICES=CUDA0,CUDA1,CUDA2`
-  - `TENSOR_SPLIT=1,1,1`
-  - `N_GPU_LAYERS=81`
+- `GPU_DEVICES=CUDA0,CUDA1,CUDA2`
+- `SPLIT_MODE=layer`
+- `TENSOR_SPLIT=0.34,0.33,0.33` (or 1,1,1 to test equal ratio)
+- `MAIN_GPU=0`
+- `N_GPU_LAYERS=81`
+- `CTX_SIZE=262000`
+- `PARALLEL=8` (raise to keep 3 GPUs busier during concurrent request flow)
+- `THREADS_BATCH=32` (batch and prompt processing threads)
+- `POLL_BATCH=1` (batching loop polling; keeps scheduling responsive)
+- `CONT_BATCHING=1` (continuous batching for occupancy smoothing)
+- `CACHE_TYPE_K=q8_0`
+- `CACHE_TYPE_V=q8_0`
 
-Load with:
+Why utilization looks spiky:
+- Single low-turnover prompts cause bursty occupancy (prefill spikes, then short decode bursts).
+- `stream=false` / tiny outputs can look like one GPU "stuttering" even with full tensor split.
+- To force steadier occupancy, generate higher sustained traffic (multiple concurrent requests or higher `PARALLEL`), then tune with `CONT_BATCHING=1`.
 
-```bash
-source configs/hy3-a100-hybrid.env
-```
-
-Then use the environment variables directly in `run_hy3_entrypoint.sh`:
+Load and run the existing entrypoint:
 
 ```bash
 source configs/hy3-a100-hybrid.env
@@ -77,33 +104,30 @@ source configs/hy3-a100-hybrid.env
 
 ## Service generator internals
 
-`generate_hy3_isolated_service.sh` writes:
+For Ollama service generation, files are written to:
+- `$XDG_CONFIG_HOME/systemd/user/<service>.service`
+- `$XDG_CONFIG_HOME/hy3/<service>.env`
 
-- `$XDG_CONFIG_HOME/systemd/user/<SERVICE>.service` (default `~/.config/systemd/user/`)
-- `$XDG_CONFIG_HOME/hy3/<SERVICE>.env` (default `~/.config/hy3/`)
+For llama-server service generation, files are written to:
+- `$XDG_CONFIG_HOME/systemd/user/<service>.service`
+- `$XDG_CONFIG_HOME/hy3/<service>-llama.env`
 
-Then `deploy_hy3_isolated.sh` does `systemctl --user enable --now` and performs readiness check.
-
-You can stop / restart with:
+Manage with:
 
 ```bash
-systemctl --user stop hy3-isolated.service
-systemctl --user start hy3-isolated.service
-systemctl --user status hy3-isolated.service
+systemctl --user stop hy3-ollama-isolated.service
+systemctl --user start hy3-ollama-isolated.service
+systemctl --user stop hy3-llama-isolated.service
+systemctl --user start hy3-llama-isolated.service
 ```
 
 ## Publish
-
-Run once to push these files to GitHub:
 
 ```bash
 ./scripts/publish_to_github.sh my-hy3-repo private
 ```
 
-If `GITHUB_OWNER` is set, it will use `OWNER/repo`; otherwise it uses your logged in GitHub user.
-
-## Notes
-
-- Existing model path used by this setup is `/srv/hy3/hy3-1M-Q2_K.gguf`.
-- If your endpoint port conflicts, change `HY3_PORT` and rerun deploy.
-- Keep model files outside version control.
+Notes:
+- Keep model artifacts and downloaded blobs out of git.
+- The existing symlink `/srv/hy3` points at `/srv/ollama/models` in this environment.
+- If model architecture issues appear on an Ollama endpoint, use the llama-server path above.
