@@ -8,11 +8,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hy3/%i.env
-ExecStart=%h/.config/hy3/%i.bin --log-file %h/.config/hy3/%i.log --host %i.host --port %i.port --model %i.model --ctx-size %i.ctx --n-gpu-layers %i.gpul --split-mode %i.splitmode --tensor-split %i.tsplit --device %i.devices --threads %i.threads --batch-size %i.batch --ubatch-size %i.ubatch --parallel %i.parallel --threads-batch %i.threads_batch --poll-batch %i.poll_batch --cont-batching --fit %i.fit
+WorkingDirectory=%h/Documents/Projects/Adjacent/hy3
+ExecStart=%h/Documents/Projects/Adjacent/hy3/run_hy3_entrypoint.sh foreground
 Restart=always
-RestartSec=2
+RestartSec=5
 LimitNOFILE=65535
-EnvironmentFile=%h/.config/hy3/%i.env
 StandardOutput=journal
 StandardError=journal
 

@@ -28,13 +28,12 @@ if [[ "$FORCE" == "1" ]] || [[ ! -f "$TARGET" ]]; then
   TMP_FILE="${TARGET}.tmp"
   echo "Downloading ${HF_URL} -> ${TARGET}"
   if command -v huggingface-cli >/dev/null 2>&1; then
-    huggingface-cli download "$HF_REPO" "$HF_FILENAME" --local-dir "$MODELS_DIR" --local-dir-use-symlinks False
-    if [[ ! -f "$TARGET" ]]; then
-      echo "ERROR: huggingface-cli did not place ${HF_FILENAME} under ${MODELS_DIR}"
-      exit 1
-    fi
+    huggingface-cli download "$HF_REPO" "$HF_FILENAME" \
+      --local-dir "$MODELS_DIR" --local-dir-use-symlinks False
+  elif command -v hf >/dev/null 2>&1; then
+    hf download "$HF_REPO" "$HF_FILENAME" --local-dir "$MODELS_DIR"
   else
-    echo "huggingface-cli not found, using direct curl"
+    echo "huggingface-cli/hf not found, using direct curl"
     curl -L --fail-with-body --retry 3 --retry-delay 2 -o "$TMP_FILE" "$HF_URL"
     mv "$TMP_FILE" "$TARGET"
   fi
@@ -52,8 +51,10 @@ echo "Model ready: $TARGET"
 echo "Bytes: $(stat -c%s "$TARGET")"
 echo "sha256: $(sha256sum "$TARGET" | cut -d' ' -f1)"
 
-echo "HF_REPO=${HF_REPO}" > "${MODELS_DIR}/hy3-active.manifest"
-echo "HF_CLASS=${HF_CLASS}" >> "${MODELS_DIR}/hy3-active.manifest"
-echo "HF_FILENAME=${HF_FILENAME}" >> "${MODELS_DIR}/hy3-active.manifest"
-echo "MODEL_PATH=${TARGET}" >> "${MODELS_DIR}/hy3-active.manifest"
-echo "FREED_AT=$(date -u +%FT%TZ)" >> "${MODELS_DIR}/hy3-active.manifest"
+{
+  echo "HF_REPO=${HF_REPO}"
+  echo "HF_CLASS=${HF_CLASS}"
+  echo "HF_FILENAME=${HF_FILENAME}"
+  echo "MODEL_PATH=${TARGET}"
+  echo "FETCHED_AT=$(date -u +%FT%TZ)"
+} > "${MODELS_DIR}/hy3-active.manifest"
