@@ -4,7 +4,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 STATE_DIR="${HY3_CAPABILITY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/hy3}"
 MODELS_DIR="${HY3_MODELS_DIR:-/srv/hy3}"
-MODEL_CLASS="${HY3_CLASS:-Q2_K}"
+MODEL_CLASS="${HY3_CLASS:-auto}"
+TIER="${HY3_TIER:-auto}"
+QUALIFICATION_POLICY="${HY3_QUALIFICATION:-auto}"
+UPGRADE="${HY3_UPGRADE:-0}"
+MTP_POLICY="${HY3_MTP:-auto}"
+HF_REPO="${HF_REPO:-satgeze/Hy3-1M-GGUF}"
 SERVICE_NAME="${HY3_SERVICE_NAME:-hy3-llama-live}"
 HOST="${HY3_HOST:-127.0.0.1}"
 PORT="${HY3_PORT:-11453}"
@@ -42,7 +47,12 @@ Options:
   --require-nccl            Fail unless NCCL headers and libraries are available.
   --update-source           Fetch and fast-forward the custom llama.cpp branch.
   --enable-linger           Enable systemd user lingering for this account.
-  --class CLASS             GGUF class, default Q2_K.
+  --class CLASS             GGUF class or auto, default auto.
+  --tier TIER               auto, speed, balanced, or quality, default auto.
+  --qualification MODE      auto, full-gpu, or hybrid, default auto.
+  --upgrade                 Force auto selection to consider a higher-ranked tier.
+  --mtp MODE                auto, on, or off, default auto.
+  --hf-repo REPO            Hugging Face GGUF repository, default satgeze/Hy3-1M-GGUF.
   --models-dir PATH         Model directory, default /srv/hy3.
   --service NAME            User systemd service name, default hy3-llama-live.
   --port PORT               Endpoint port, default 11453.
@@ -72,6 +82,11 @@ while [[ $# -gt 0 ]]; do
     --update-source) UPDATE_SOURCE=1 ;;
     --enable-linger) ENABLE_LINGER=1 ;;
     --class) shift; MODEL_CLASS="${1:?missing value for --class}" ;;
+    --tier) shift; TIER="${1:?missing value for --tier}" ;;
+    --qualification) shift; QUALIFICATION_POLICY="${1:?missing value for --qualification}" ;;
+    --upgrade) UPGRADE=1 ;;
+    --mtp) shift; MTP_POLICY="${1:?missing value for --mtp}" ;;
+    --hf-repo) shift; HF_REPO="${1:?missing value for --hf-repo}" ;;
     --models-dir) shift; MODELS_DIR="${1:?missing value for --models-dir}" ;;
     --service) shift; SERVICE_NAME="${1:?missing value for --service}" ;;
     --port) shift; PORT="${1:?missing value for --port}" ;;
@@ -83,9 +98,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-MODEL_FILENAME="hy3-1M-$MODEL_CLASS.gguf"
-if [[ -v HY3_FILENAME ]]; then MODEL_FILENAME="$HY3_FILENAME"; fi
-MODEL_PATH="$MODELS_DIR/$MODEL_FILENAME"
+REQUESTED_CLASS="$MODEL_CLASS"
 LLAMA_SERVER_BIN="$BUILD_DIR/bin/llama-server"
 CAPABILITY_ENV="$STATE_DIR/capabilities.env"
 
@@ -105,9 +118,9 @@ case "$SYSTEMD_STATE" in
 esac
 [[ "$SYSTEMD_STATE" == "running" ]] || warn "user systemd is degraded; unrelated user units may remain unhealthy"
 
-APT_PACKAGES=(build-essential cmake git curl jq pkg-config libssl-dev)
+APT_PACKAGES=(build-essential cmake git curl jq pkg-config libssl-dev ripgrep iproute2)
 missing_packages=()
-for command_name in cmake git curl jq pkg-config; do
+for command_name in cmake git curl jq pkg-config rg ss; do
   command -v "$command_name" >/dev/null 2>&1 || missing_packages+=("$command_name")
 done
 if (( ${#missing_packages[@]} > 0 )); then
@@ -174,6 +187,20 @@ if [[ "$REQUIRE_NCCL" == "1" && "$NCCL_AVAILABLE" != "1" ]]; then
   die "NCCL was required but headers/library were not detected"
 fi
 
+log "resolving Hy3 model profile"
+HY3_CAPABILITY_ENV="$CAPABILITY_ENV" HY3_MODELS_DIR="$MODELS_DIR" \
+  HY3_CLASS_REQUESTED="$MODEL_CLASS" HY3_TIER="$TIER" \
+  HY3_QUALIFICATION="$QUALIFICATION_POLICY" HY3_UPGRADE="$UPGRADE" \
+  HY3_MTP="$MTP_POLICY" HY3_CTX_SIZE="$CTX_SIZE" \
+  HY3_SERVICE_NAME="$SERVICE_NAME" HF_REPO="$HF_REPO" \
+  LLAMA_SERVER_BIN="$LLAMA_SERVER_BIN" \
+  "$SCRIPT_DIR/resolve_hy3_profile.sh"
+# shellcheck disable=SC1090
+source "$STATE_DIR/profile.env"
+MODEL_CLASS="$SELECTED_CLASS"
+MODEL_FILENAME="$SELECTED_FILENAME"
+MODEL_PATH="$MODELS_DIR/$MODEL_FILENAME"
+
 GPU_DEVICES=""
 TENSOR_SPLIT=""
 for ((i = 0; i < A100_COUNT; i++)); do
@@ -181,18 +208,7 @@ for ((i = 0; i < A100_COUNT; i++)); do
   [[ -z "$TENSOR_SPLIT" ]] && TENSOR_SPLIT="1" || TENSOR_SPLIT="$TENSOR_SPLIT,1"
 done
 
-MODEL_BYTES=0
-case "$MODEL_CLASS" in
-  IQ2_M) MODEL_BYTES=96019311104 ;;
-  MTP-IQ2_M) MODEL_BYTES=100008834592 ;;
-  MTP-Q3_XXS) MODEL_BYTES=117335832096 ;;
-  MTP-Q2_K|Q2_K) MODEL_BYTES=111376119328 ;;
-  MTP-Q3_K_M) MODEL_BYTES=144948000288 ;;
-  MTP-Q4_K_M) MODEL_BYTES=182560831008 ;;
-  MTP-Q5_K_M) MODEL_BYTES=213423044128 ;;
-  MTP-Q6_K) MODEL_BYTES=246214145568 ;;
-  *) warn "unknown model class $MODEL_CLASS; disk preflight is conservative" ;;
-esac
+MODEL_BYTES="$SELECTED_BYTES"
 
 mkdir -p "$MODELS_DIR" || die "cannot create model directory $MODELS_DIR"
 MODEL_ROOT="$(readlink -f "$MODELS_DIR" 2>/dev/null || printf '%s' "$MODELS_DIR")"
@@ -206,6 +222,10 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
   log "dry-run deployment plan:"
   log "  model: $MODEL_PATH"
+  log "  requested class/tier: $REQUESTED_CLASS/$TIER"
+  log "  selected profile: $SELECTED_CLASS ($SELECTED_QUALIFICATION, mtp=$SELECTED_MTP)"
+  log "  qualification reason: $SELECTED_REASON"
+  log "  catalog: $CATALOG_SOURCE"
   log "  service: $SERVICE_NAME on $HOST:$PORT"
   log "  A100 ids: $A100_IDS"
   log "  CUDA devices: $GPU_DEVICES"
@@ -223,7 +243,7 @@ elif [[ -s "$MODEL_PATH" ]]; then
   log "model already present: $MODEL_PATH"
 else
   log "pulling $MODEL_CLASS into $MODELS_DIR"
-  HY3_MODELS_DIR="$MODELS_DIR" HY3_CLASS="$MODEL_CLASS" HY3_FILENAME="$MODEL_FILENAME" \
+  HF_REPO="$HF_REPO" HY3_MODELS_DIR="$MODELS_DIR" HY3_CLASS="$MODEL_CLASS" HY3_FILENAME="$MODEL_FILENAME" \
     "$SCRIPT_DIR/pull_hy3_gguf.sh" 0
 fi
 
@@ -244,15 +264,13 @@ if command -v ss >/dev/null 2>&1; then
   fi
 fi
 
-SPEC_TYPE=none
-[[ "$MODEL_CLASS" == MTP-* ]] && SPEC_TYPE=draft-mtp
 log "generating systemd user service"
 HY3_CONFIG_FILE="$REPO_DIR/configs/hy3-a100-hybrid.env" \
   CUDA_VISIBLE_DEVICES="$A100_IDS" NVIDIA_VISIBLE_DEVICES="$A100_IDS" \
   GPU_DEVICES="$GPU_DEVICES" TENSOR_SPLIT="$TENSOR_SPLIT" \
-  CTX_SIZE="$CTX_SIZE" N_GPU_LAYERS=all SPLIT_MODE=layer PARALLEL=1 \
-  CONT_BATCHING=0 FIT=off CPU_MOE=0 FLASH_ATTN=on \
-  CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 SPEC_TYPE="$SPEC_TYPE" \
+  CTX_SIZE="$CTX_SIZE" N_GPU_LAYERS="$PROFILE_N_GPU_LAYERS" SPLIT_MODE=layer PARALLEL=1 \
+  CONT_BATCHING=0 FIT="$PROFILE_FIT" CPU_MOE=0 FLASH_ATTN=on \
+  CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 SPEC_TYPE="$PROFILE_SPEC_TYPE" \
   REQUIRE_GPU_COUNT="$REQUIRE_A100_COUNT" LOG_FILE="$HOME/.config/hy3/$SERVICE_NAME.log" \
   "$SCRIPT_DIR/generate_hy3_llama_service.sh" \
   "$SERVICE_NAME" "$PORT" "$HOST" "$MODEL_PATH" "$LLAMA_SERVER_BIN"
@@ -292,6 +310,12 @@ SERVICE_NAME=$SERVICE_NAME
 HOST=$HOST
 PORT=$PORT
 MODEL_CLASS=$MODEL_CLASS
+REQUESTED_CLASS=$REQUESTED_CLASS
+SELECTED_CLASS=$SELECTED_CLASS
+SELECTED_TIER=$SELECTED_TIER
+QUALIFICATION=$SELECTED_QUALIFICATION
+QUALIFICATION_REASON=$SELECTED_REASON
+SELECTED_MTP=$SELECTED_MTP
 MODEL_PATH=$MODEL_PATH
 MODEL_SHA256=$MODEL_SHA256
 CTX_SIZE=$CTX_SIZE
@@ -299,6 +323,9 @@ CUDA_VISIBLE_DEVICES=$A100_IDS
 GPU_DEVICES=$GPU_DEVICES
 TENSOR_SPLIT=$TENSOR_SPLIT
 NCCL_AVAILABLE=$NCCL_AVAILABLE
+CATALOG_SOURCE=$CATALOG_SOURCE
+PROFILE_ENV=$STATE_DIR/profile.env
+PROFILE_JSON=$STATE_DIR/profile.json
 LLAMA_CPP_DIR=$LLAMA_CPP_DIR
 LLAMA_SERVER_BIN=$LLAMA_SERVER_BIN
 CAPABILITIES_ENV=$CAPABILITY_ENV

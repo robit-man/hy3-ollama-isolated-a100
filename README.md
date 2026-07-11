@@ -30,6 +30,11 @@ run as explicit profiles rather than replacing the stable three-card service.
   with CUDA, NCCL, CUDA graphs, A100 architecture 80, and
   GGML_CUDA_FA_ALL_QUANTS=ON.
 - scripts/pull_hy3_gguf.sh: downloads and records any supported Hy3 GGUF.
+- scripts/probe_hy3_host.sh: writes a capability inventory for the local host.
+- scripts/resolve_hy3_profile.sh: resolves a requested class/tier into a
+  memory-qualified model and service profile.
+- scripts/install_hy3.sh: performs the capability-aware dependency, model,
+  build, service, and smoke-test flow.
 - scripts/generate_hy3_llama_service.sh: generates a user systemd unit and
   environment file.
 - scripts/deploy_hy3_llama_isolated.sh: pulls if needed, regenerates,
@@ -74,6 +79,60 @@ hy3-1M-Q2_K.gguf. For an MTP artifact, use for example:
     SPEC_DRAFT_N_MAX=3 \
     SPEC_DRAFT_P_MIN=0.75 \
     ./scripts/deploy_hy3_llama_isolated.sh
+
+## Automatic model and deployment qualification
+
+The end-to-end installer can choose a Satgeze artifact instead of requiring a
+hard-coded filename. It queries the live `satgeze/Hy3-1M-GGUF` tree, falls
+back to a versioned catalog if Hugging Face is temporarily unavailable, and
+uses the detected A100 count, per-device VRAM, current CUDA/NCCL capability,
+active service, unrelated GPU occupants, and requested context to qualify the
+candidate.
+
+The class is an exact artifact selector. Current catalog classes include
+`IQ2_M`, `Q2_K`, `MTP-IQ2_M`, `MTP-IQ3_XXS`, `MTP-Q2_K`, `MTP-Q3_K_M`,
+`MTP-Q4_K_M`, `MTP-Q5_K_M`, and `MTP-Q6_K`. The separate `hy3-mtp-head-f16`
+file is not treated as a standalone deployment model.
+
+Use `--class auto` to let the resolver select a class. Use `--tier` to set
+the ranking policy:
+
+- `speed`: favors `IQ2_M` and `Q2_K` before lower MTP tiers.
+- `balanced`: considers the small MTP tiers after the fast non-MTP tiers.
+- `quality`: considers the largest MTP artifact that fits, then descends.
+- `auto`: uses the quality ordering on a fresh install.
+
+Use `--qualification` to set the memory policy:
+
+- `auto`: requires a full-GPU candidate and fails rather than silently
+  degrading to host-memory weights.
+- `full-gpu`: requires `N_GPU_LAYERS=all`, `FIT=off`, and `CPU_MOE=0`.
+- `hybrid`: permits `N_GPU_LAYERS=auto` and `FIT=on`, but still refuses
+  `CPU_MOE=1`; this is an explicit fallback for a larger artifact.
+
+At 262K context, the estimator reserves q8 KV memory proportional to the
+requested context plus a per-GPU safety reserve. It subtracts memory used by
+other compute processes, including the ordinary Ollama service, before
+accepting full-GPU placement. This means `auto` can select a smaller tier on a
+busy host and a larger tier after the competing process is stopped. The
+currently active full-GPU model is preserved by `--class auto --tier auto`
+unless `--upgrade` is supplied, which avoids an unnecessary model pull and
+service restart.
+
+Examples:
+
+    ./scripts/install_hy3.sh --dry-run --class auto --tier auto
+    ./scripts/install_hy3.sh --class auto --tier speed
+    ./scripts/install_hy3.sh --class auto --tier quality --upgrade
+    ./scripts/install_hy3.sh --class MTP-Q4_K_M --qualification full-gpu
+    ./scripts/install_hy3.sh --class auto --qualification hybrid
+    ./scripts/install_hy3.sh --class auto --mtp off
+
+MTP candidates are used only when the selected llama-server advertises
+`draft-mtp`; `--mtp off` excludes them and `--mtp on` makes missing MTP
+support a hard error. The resolver writes the selected decision to
+`$XDG_STATE_HOME/hy3/profile.env` and `profile.json` so the generated service,
+install manifest, and later diagnostics all refer to the same profile.
 
 ## Deploy the live endpoint
 
@@ -195,6 +254,8 @@ The default flow:
   found by CMake;
 - generates the service with the detected physical A100 ids, not a hardcoded
   assumption that the cards are GPUs 0, 1, and 2;
+- resolves `auto` quantization/tier and full-GPU versus explicit hybrid
+  qualification before downloading weights;
 - restarts only the named user service, waits for /health, verifies the
   reported context window, runs a completion, and records GPU residency.
 
@@ -202,7 +263,7 @@ Run a read-only plan first:
 
     ./scripts/install_hy3.sh --dry-run --no-build --no-pull
 
-Install or reconcile the current Q2_K deployment:
+Install or reconcile the active deployment using automatic qualification:
 
     ./scripts/install_hy3.sh --enable-linger
 
@@ -212,10 +273,15 @@ The installer writes host-specific state outside the repository:
 - $XDG_STATE_HOME/hy3/capabilities.md
 - $XDG_STATE_HOME/hy3/nvidia-topology.txt
 - $XDG_STATE_HOME/hy3/install.manifest
+- $XDG_STATE_HOME/hy3/profile.env
+- $XDG_STATE_HOME/hy3/profile.json
 
 Useful overrides:
 
-    ./scripts/install_hy3.sh --class MTP-IQ2_M
+    ./scripts/install_hy3.sh --class MTP-IQ2_M --qualification full-gpu
+    ./scripts/install_hy3.sh --tier quality --upgrade
+    ./scripts/install_hy3.sh --qualification hybrid --class auto
+    ./scripts/install_hy3.sh --hf-repo satgeze/Hy3-1M-GGUF
     ./scripts/install_hy3.sh --context 131072
     ./scripts/install_hy3.sh --no-system-packages --no-build --no-pull
     ./scripts/install_hy3.sh --install-nccl --require-nccl
