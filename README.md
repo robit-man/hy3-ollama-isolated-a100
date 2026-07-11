@@ -1,297 +1,443 @@
-# Hy3 isolated llama.cpp and Ollama deployment
+# Hy3 isolated llama.cpp deployment for three A100s
 
-This repository deploys the Hy3 GGUF weights from satgeze/Hy3-1M-GGUF as a
-dedicated local llama-server endpoint. The supported production path is the
-custom satindergrewal/llama.cpp hy3-mtp branch; the ordinary Ollama endpoint
-is retained as a separate convenience path and is not the performance target.
+This repository installs and serves the Hy3 GGUF distillations from
+`satgeze/Hy3-1M-GGUF` through the custom `satindergrewal/llama.cpp`
+`hy3-mtp` branch. The production endpoint is an isolated, OpenAI-compatible
+`llama-server` service. It is not the ordinary Ollama service and does not
+replace Ollama's default endpoint.
 
-The live configuration is designed for three A100 80 GB cards:
+## Quick start: just do this
 
-- CUDA_VISIBLE_DEVICES=0,1,2
-- --device CUDA0,CUDA1,CUDA2
-- --split-mode layer
-- --tensor-split 1,1,1
-- --n-gpu-layers all
-- --ctx-size 262000
-- --parallel 1
-- q8 KV cache and CUDA Flash Attention
-- no --cpu-moe and --fit off, so an unsafe partial/CPU fallback fails at
-  startup instead of silently producing a 0.3 tok/s server
+Run this as the target service user from a login session, not as root:
 
-Layer split is the stable mode for the current topology. A100s 0 and 2 are
-NVLinked; A100 1 is PCIe-connected. Tensor or two-card experiments should be
-run as explicit profiles rather than replacing the stable three-card service.
+```bash
+git clone https://github.com/robit-man/hy3-ollama-isolated-a100.git
+cd hy3-ollama-isolated-a100
 
-## Repository files
+./scripts/install_hy3.sh \
+  --class auto \
+  --tier auto \
+  --qualification auto \
+  --install-nccl \
+  --enable-linger
+```
 
-- configs/hy3-a100-hybrid.env: shared three-A100 serving profile.
-- run_hy3_entrypoint.sh: manual launcher and systemd foreground entrypoint.
-- scripts/build_llama_cpp_hy3.sh: clones or updates the Hy3 branch and builds
-  with CUDA, NCCL, CUDA graphs, A100 architecture 80, and
-  GGML_CUDA_FA_ALL_QUANTS=ON.
-- scripts/pull_hy3_gguf.sh: downloads and records any supported Hy3 GGUF.
-- scripts/probe_hy3_host.sh: writes a capability inventory for the local host.
-- scripts/resolve_hy3_profile.sh: resolves a requested class/tier into a
-  memory-qualified model and service profile.
-- scripts/install_hy3.sh: performs the capability-aware dependency, model,
-  build, service, and smoke-test flow.
-- scripts/generate_hy3_llama_service.sh: generates a user systemd unit and
-  environment file.
-- scripts/deploy_hy3_llama_isolated.sh: pulls if needed, regenerates,
-  restarts, waits for readiness, and runs the HTTP smoke test.
-- scripts/test_hy3_endpoint.sh: verifies health, model metadata, context
-  reporting, generation, usage, timing, and GPU processes.
-- deploy_hy3.sh: separate official Ollama pull/evaluation helper.
+The installer detects the host, installs missing build dependencies, resolves
+the best qualified Hy3 artifact, builds the custom CUDA server, generates the
+user systemd unit, pulls missing weights, restarts only the Hy3 service, and
+runs an API/GPU smoke test.
 
-## Build the custom server
+Check the endpoint:
 
-The existing checkout can be rebuilt without fetching source:
+```bash
+curl -fsS http://127.0.0.1:11453/health
+curl -fsS http://127.0.0.1:11453/v1/models | jq '.data[0].meta | {n_ctx,n_ctx_train,ftype,size}'
+systemctl --user status hy3-llama-live.service --no-pager
+```
 
-    ./scripts/build_llama_cpp_hy3.sh
+Expected endpoint: `http://127.0.0.1:11453`.
 
-To fetch the current branch first:
+For a fail-closed NCCL requirement, add `--require-nccl`. NCCL is not needed
+for the default layer-split service, but it is required for future
+tensor-parallel experiments. The installer uses `sudo` only for apt packages
+and optional user lingering; it must retain the target user's systemd and
+`XDG_RUNTIME_DIR` environment.
 
-    UPDATE_SOURCE=1 ./scripts/build_llama_cpp_hy3.sh
+## Current observed deployment
 
-The build script refuses to reconfigure a dirty llama.cpp checkout. It also
-fails if the resulting CMake cache does not show both
-GGML_CUDA_FA_ALL_QUANTS=ON and GGML_CUDA_NCCL=ON.
+The following is the verified state of the reference host as of 2026-07-11.
+It is an operational snapshot, not a promise that a future automatic install
+will choose the same artifact after hardware, process load, or the Hugging
+Face catalog changes.
 
-## Pull weights
+| Item | Observed value |
+| --- | --- |
+| Service | `hy3-llama-live.service`, active |
+| Endpoint | `127.0.0.1:11453` |
+| Model | `/srv/hy3/hy3-1M-Q2_K.gguf` |
+| Weight file | `111376119328` bytes |
+| Runtime context | `262144` tokens |
+| Training context | `1048576` tokens |
+| Quantization | `Q2_K - Medium` |
+| Parameters reported | `298786155776` |
+| A100 devices | `0,1,2` |
+| GPU placement | all model layers on CUDA, layer split `1,1,1` |
+| KV cache | q8 for K and V |
+| Service slots | `1` |
+| Flash Attention | enabled |
+| CPU MoE fallback | disabled |
+| CUDA driver | `580.82.07` |
+| CUDA toolkit | `12.0` |
+| NCCL package | `2.18.5-1-2` |
+| llama.cpp branch | `hy3-mtp` |
+| llama.cpp checkout observed | `56142c5f8` |
 
-The installed host currently has the non-MTP Q2_K artifact:
+The model process was observed holding approximately 52 GiB on each A100.
+The host also contains a GeForce GT 1030 at CUDA index 3; it is intentionally
+excluded. The service uses physical A100 ids detected by the probe rather than
+assuming that every visible GPU is suitable.
 
-    HY3_MODELS_DIR=/srv/hy3 HY3_CLASS=Q2_K ./scripts/pull_hy3_gguf.sh 0
+The current topology is:
 
-The MTP path is supported, but it must use an MTP GGUF and the corresponding
-runtime flag. The practical MTP quant is approximately 100 GB:
+```text
+GPU0 <-> GPU2: NV12
+GPU0 <-> GPU1: NODE
+GPU1 <-> GPU2: PHB
+```
 
-    HY3_MODELS_DIR=/srv/hy3 \
-    HY3_CLASS=MTP-IQ2_M \
-    ./scripts/pull_hy3_gguf.sh 0
+Layer split across all three A100s is the stable production profile for this
+topology. Fragmented or alternating GPU utilization during single-token decode
+is expected: layer groups take turns processing each token. The decisive
+checks are model residency on all three A100s, no CPU weight fallback, no
+unified-memory spill, and successful generation.
 
-Do not set SPEC_TYPE=draft-mtp for the installed non-MTP
-hy3-1M-Q2_K.gguf. For an MTP artifact, use for example:
+## Model and profile selection
 
-    HY3_CLASS=MTP-IQ2_M \
-    HY3_FILENAME=hy3-1M-MTP-IQ2_M.gguf \
-    SPEC_TYPE=draft-mtp \
-    SPEC_DRAFT_N_MAX=3 \
-    SPEC_DRAFT_P_MIN=0.75 \
-    ./scripts/deploy_hy3_llama_isolated.sh
+The installer defaults to capability-aware selection:
 
-## Automatic model and deployment qualification
+```text
+--class auto
+--tier auto
+--qualification auto
+```
 
-The end-to-end installer can choose a Satgeze artifact instead of requiring a
-hard-coded filename. It queries the live `satgeze/Hy3-1M-GGUF` tree, falls
-back to a versioned catalog if Hugging Face is temporarily unavailable, and
-uses the detected A100 count, per-device VRAM, current CUDA/NCCL capability,
-active service, unrelated GPU occupants, and requested context to qualify the
-candidate.
+The resolver queries the live `satgeze/Hy3-1M-GGUF` catalog, with a built-in
+fallback catalog if Hugging Face is temporarily unavailable. It considers the
+available A100s, per-device VRAM, requested context, current service profile,
+MTP support, and memory used by unrelated compute processes. The separate
+`hy3-mtp-head-f16.gguf` file is not selected as a standalone model.
 
-The class is an exact artifact selector. Current catalog classes include
-`IQ2_M`, `Q2_K`, `MTP-IQ2_M`, `MTP-IQ3_XXS`, `MTP-Q2_K`, `MTP-Q3_K_M`,
-`MTP-Q4_K_M`, `MTP-Q5_K_M`, and `MTP-Q6_K`. The separate `hy3-mtp-head-f16`
-file is not treated as a standalone deployment model.
+Available artifact classes currently include:
 
-Use `--class auto` to let the resolver select a class. Use `--tier` to set
-the ranking policy:
+```text
+IQ2_M
+Q2_K
+MTP-IQ2_M
+MTP-IQ3_XXS
+MTP-Q2_K
+MTP-Q3_K_M
+MTP-Q4_K_M
+MTP-Q5_K_M
+MTP-Q6_K
+```
 
-- `speed`: favors `IQ2_M` and `Q2_K` before lower MTP tiers.
-- `balanced`: considers the small MTP tiers after the fast non-MTP tiers.
-- `quality`: considers the largest MTP artifact that fits, then descends.
-- `auto`: uses the quality ordering on a fresh install.
+Tier ordering:
 
-Use `--qualification` to set the memory policy:
+| Tier | Selection order |
+| --- | --- |
+| `speed` | `IQ2_M`, `Q2_K`, then small MTP candidates |
+| `balanced` | fast non-MTP candidates, then `MTP-IQ2_M`, `MTP-Q2_K`, `MTP-IQ3_XXS` |
+| `quality` | largest MTP candidate that qualifies, descending |
+| `auto` | quality ordering on a fresh install; preserves an active qualified model unless upgraded |
 
-- `auto`: requires a full-GPU candidate and fails rather than silently
-  degrading to host-memory weights.
-- `full-gpu`: requires `N_GPU_LAYERS=all`, `FIT=off`, and `CPU_MOE=0`.
-- `hybrid`: permits `N_GPU_LAYERS=auto` and `FIT=on`, but still refuses
-  `CPU_MOE=1`; this is an explicit fallback for a larger artifact.
+Qualification modes:
 
-At 262K context, the estimator reserves q8 KV memory proportional to the
-requested context plus a per-GPU safety reserve. It subtracts memory used by
-other compute processes, including the ordinary Ollama service, before
-accepting full-GPU placement. This means `auto` can select a smaller tier on a
-busy host and a larger tier after the competing process is stopped. The
-currently active full-GPU model is preserved by `--class auto --tier auto`
-unless `--upgrade` is supplied, which avoids an unnecessary model pull and
-service restart.
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Requires a full-GPU candidate and fails rather than silently degrading |
+| `full-gpu` | Uses `N_GPU_LAYERS=all`, `FIT=off`, and `CPU_MOE=0` |
+| `hybrid` | Explicitly permits `N_GPU_LAYERS=auto` and `FIT=on`; still keeps `CPU_MOE=0` |
+
+The memory check estimates q8 KV usage proportionally to the requested
+context, adds a safety reserve, and subtracts memory used by other GPU
+processes. This prevents a model from appearing to fit based only on total
+VRAM while actually spilling to host memory at runtime.
 
 Examples:
 
-    ./scripts/install_hy3.sh --dry-run --class auto --tier auto
-    ./scripts/install_hy3.sh --class auto --tier speed
-    ./scripts/install_hy3.sh --class auto --tier quality --upgrade
-    ./scripts/install_hy3.sh --class MTP-Q4_K_M --qualification full-gpu
-    ./scripts/install_hy3.sh --class auto --qualification hybrid
-    ./scripts/install_hy3.sh --class auto --mtp off
+```bash
+# Read-only plan. Does not build, download, or restart.
+./scripts/install_hy3.sh --dry-run --no-build --no-pull
 
-MTP candidates are used only when the selected llama-server advertises
-`draft-mtp`; `--mtp off` excludes them and `--mtp on` makes missing MTP
-support a hard error. The resolver writes the selected decision to
-`$XDG_STATE_HOME/hy3/profile.env` and `profile.json` so the generated service,
-install manifest, and later diagnostics all refer to the same profile.
+# Prefer the fastest artifact that qualifies.
+./scripts/install_hy3.sh --class auto --tier speed
 
-## Deploy the live endpoint
+# Re-evaluate an active deployment for a higher-ranked artifact.
+./scripts/install_hy3.sh --class auto --tier quality --upgrade
 
-The default endpoint is http://127.0.0.1:11453. The deploy script must
-restart an already active unit after regeneration; this is intentional because
-systemctl enable --now alone does not replace an already-running process.
+# Require one exact MTP artifact and full GPU residency.
+./scripts/install_hy3.sh --class MTP-IQ2_M --qualification full-gpu --mtp on
 
-    HY3_MODELS_DIR=/srv/hy3 \
-    HY3_CLASS=Q2_K \
-    HY3_SERVICE_NAME=hy3-llama-live \
-    HY3_PORT=11453 \
-    ./scripts/deploy_hy3_llama_isolated.sh
+# Explicitly permit host-memory layer placement for a larger artifact.
+./scripts/install_hy3.sh --class auto --qualification hybrid
 
-For a fast smoke test without deployment:
+# Exclude MTP candidates.
+./scripts/install_hy3.sh --class auto --mtp off
+```
 
-    HY3_ENDPOINT_URL=http://127.0.0.1:11453 \
-    HY3_MODEL=/srv/hy3/hy3-1M-Q2_K.gguf \
-    HY3_EXPECTED_CTX=262000 \
-    ./scripts/test_hy3_endpoint.sh
+MTP candidates are accepted only when the selected `llama-server` advertises
+`draft-mtp`. `--mtp on` makes missing support a hard error. MTP profiles use
+`SPEC_TYPE=draft-mtp`; non-MTP profiles do not.
 
-The generated files are:
+The resolver records its decision outside the repository:
 
-- $XDG_CONFIG_HOME/systemd/user/<service>.service
-- $XDG_CONFIG_HOME/hy3/<service>-llama.env
+```text
+$XDG_STATE_HOME/hy3/profile.env
+$XDG_STATE_HOME/hy3/profile.json
+```
 
-Useful service commands:
+## Installation and deployment behavior
 
-    systemctl --user status hy3-llama-live.service --no-pager
-    systemctl --user restart hy3-llama-live.service
-    journalctl --user -u hy3-llama-live.service -f
+`scripts/install_hy3.sh` is the supported end-to-end entrypoint. It is a user
+service installer, not a root installer. It performs these checks and actions:
 
-## Context and throughput
+1. Validates the user systemd session and required host commands.
+2. Probes OS, NVIDIA driver, CUDA toolkit, A100 count, VRAM, topology, NCCL,
+   linger state, model storage, and endpoint conflicts.
+3. Installs missing Ubuntu build tools when apt and sudo are available.
+4. Optionally installs `libnccl2` and `libnccl-dev`.
+5. Resolves the model class, tier, MTP mode, context, and GPU qualification.
+6. Checks model disk headroom before downloading.
+7. Builds the custom branch with CUDA architecture 80, CUDA graphs, NCCL,
+   and `GGML_CUDA_FA_ALL_QUANTS=ON`.
+8. Generates a user systemd service using the detected A100 ids.
+9. Restarts only the named service, waits for `/health`, and runs the smoke
+   test unless disabled.
+10. Writes a host-specific install manifest and profile decision.
 
-CTX_SIZE is the server hard cap and is chosen at startup. The current profile
-exposes 262,000 tokens to Omnius while allocating one server slot, which
-avoids dividing that capacity into eight smaller slots. A client can request a
-smaller effective context where its backend supports per-request num_ctx/n_ctx;
-changing the hard cap requires service restart.
+The default minimum is three A100s:
 
-The 1M model label is a maximum capability, not a sensible always-on
-allocation. q8 KV memory grows approximately linearly with context, so use
-32K-128K for throughput benchmarks and reserve 262K for sessions that need it.
-Do not raise PARALLEL until single-stream generation is healthy.
+```text
+HY3_REQUIRE_A100_COUNT=3
+```
 
-The server's /v1/models metadata should report meta.n_ctx or meta.n_ctx_train.
-Omnius should normalize that value to its contextWindowTokens field and compute
-context percentage from prompt plus completion tokens. The endpoint smoke test
-fails if no context field is reported, preventing a deployment that would leave
-the Omnius context viewer blind.
+Useful installer options:
 
-## Hybrid mode
+```text
+--class CLASS              Exact artifact class or auto
+--tier auto|speed|balanced|quality
+--qualification auto|full-gpu|hybrid
+--upgrade                  Re-rank instead of preserving the active profile
+--mtp auto|on|off
+--context TOKENS           Startup context cap; default 262000
+--models-dir PATH          Default /srv/hy3
+--service NAME             Default hy3-llama-live
+--port PORT                Default 11453
+--llama-cpp-dir PATH       Default ../llama.cpp
+--no-build                 Reuse existing llama-server
+--no-pull                  Require the selected model to already exist
+--no-restart               Generate files without touching the active process
+--no-smoke                 Skip the post-deploy completion test
+--update-source            Fetch the custom llama.cpp branch before building
+```
 
-The default is full CUDA residency because this Q2_K artifact fits across the
-three A100s and CPU execution is the known performance cliff. CPU-side
-tokenization, sampling, and server threads still operate normally. If a
-larger quant genuinely requires CPU weight placement, opt into a fallback
-profile explicitly:
+The generated unit has a five-minute stop timeout so a long request can drain
+during an intentional restart. Do not restart the service during an Omnius
+task unless waiting up to five minutes for that request is acceptable. Use
+`--no-restart` to stage a profile safely and apply it later.
 
-    N_GPU_LAYERS=auto FIT=on CPU_MOE=0 ./scripts/deploy_hy3_llama_isolated.sh
+Host-specific state is stored outside git:
 
-Do not use CPU_MOE=1 for the performance target. It keeps all expert weights
-in host memory and is expected to collapse generation speed.
+```text
+$XDG_STATE_HOME/hy3/capabilities.env
+$XDG_STATE_HOME/hy3/capabilities.json
+$XDG_STATE_HOME/hy3/capabilities.md
+$XDG_STATE_HOME/hy3/nvidia-topology.txt
+$XDG_STATE_HOME/hy3/profile.env
+$XDG_STATE_HOME/hy3/profile.json
+$XDG_STATE_HOME/hy3/install.manifest
+```
 
-## Omnius integration
+Generated user files are:
 
-The Omnius project should use:
+```text
+$XDG_CONFIG_HOME/systemd/user/<service>.service
+$XDG_CONFIG_HOME/hy3/<service>-llama.env
+$XDG_CONFIG_HOME/hy3/<service>.log
+```
 
-    backendType=vllm
-    backendUrl=http://127.0.0.1:11453
-    model=/srv/hy3/hy3-1M-Q2_K.gguf
+On the reference host, `/srv/hy3` resolves to the model storage used by the
+isolated Ollama installation. Keep model files, logs, downloaded blobs, and
+`.omnius` state out of this repository.
 
-A live task can be run against a repository without changing the global
-Omnius config:
+## Context behavior
 
-    omnius run "Inspect the repository and report the smallest safe improvement." \
-      --repo /path/to/repository \
-      --backend vllm \
-      --backend-url http://127.0.0.1:11453 \
-      --model /srv/hy3/hy3-1M-Q2_K.gguf \
-      --timeout-ms 900000 \
-      --verbose
+`CTX_SIZE` is a server startup cap. The current service is configured with
+`262000`, and the API reports the normalized runtime value `262144`. The model
+reports `1048576` training context, but the service does not reserve a 1M
+token KV cache by default.
 
-Keep thinking and the requested context policy explicit in the Omnius project
-settings. Thinking is an Omnius request behavior; it is not enabled by the
-llama-server process unless the prompt/template asks for reasoning.
+Changing the hard cap requires regenerating and restarting the service:
 
-## Diagnostics
+```bash
+./scripts/install_hy3.sh --context 131072
+```
 
-Check that all three A100s are visible and that no unrelated service is
-occupying the endpoint:
+A client may request a smaller effective context when its backend supports
+per-request `num_ctx` or equivalent. Smaller contexts generally reduce KV
+memory and improve responsiveness. Do not increase `--parallel` while
+optimizing single-stream decode; the current service deliberately uses one
+slot so a 262K context is not divided among multiple slots.
 
-    nvidia-smi --query-gpu=index,name,memory.used,memory.free,utilization.gpu --format=csv
-    nvidia-smi topo -m
-    ss -ltnp | rg ':11453'
-    curl -fsS http://127.0.0.1:11453/health
-    curl -fsS http://127.0.0.1:11453/v1/models | jq
+The endpoint's context metadata is available at:
 
-Fragmented utilization is expected with --split-mode layer and one
-single-token decode stream: each layer group takes its turn. It is not proof
-that only one GPU holds the model. The acceptance checks are all three devices
-visible, model load without CPU fallback, no unified-memory spill, and a
-successful completion with measured tokens per second.
+```bash
+curl -fsS http://127.0.0.1:11453/v1/models | jq '.data[0].meta'
+```
 
-Keep model files, logs, .omnius state, and downloaded blobs out of git.
+## Benchmarks and interpretation
 
-## End-to-end capability-aware installation
+The repository has an API smoke test, not a standardized sustained benchmark.
+Generation speed depends on prompt length, context length, quantization,
+MTP acceptance rate, competing GPU processes, and whether another request is
+occupying the single server slot.
 
-Use the installer from the target user's login session. It is intentionally
-not a root script because it installs a user systemd service for that account.
-The default flow:
+Observed results on the reference host:
 
-- detects the OS, CUDA toolkit, NVIDIA driver, A100 count, VRAM, topology,
-  NCCL, systemd user state, linger, model filesystem, and endpoint conflicts;
-- installs missing Ubuntu build dependencies when apt and sudo are available;
-- optionally installs NCCL if the configured NVIDIA apt repository provides it;
-- refuses to deploy the default profile unless at least three A100s are found;
-- pulls the selected GGUF only when it is absent and checks disk headroom first;
-- builds the custom Hy3 branch with CUDA 80 and reports whether NCCL was really
-  found by CMake;
-- generates the service with the detected physical A100 ids, not a hardcoded
-  assumption that the cards are GPUs 0, 1, and 2;
-- resolves `auto` quantization/tier and full-GPU versus explicit hybrid
-  qualification before downloading weights;
-- restarts only the named user service, waits for /health, verifies the
-  reported context window, runs a completion, and records GPU residency.
+| Condition | Result |
+| --- | --- |
+| Prior clean install smoke, Q2_K, one slot | approximately `27.5 tok/s` |
+| Latest live smoke while an existing Omnius workload was active | `23` completion tokens in `156.720 s`, `0.15 tok/s` |
 
-Run a read-only plan first:
+The `0.15 tok/s` result is a contention/queue measurement, not a clean Hy3
+decode benchmark. The server was intentionally not restarted or interrupted,
+and a second request had to share a one-slot service with the live workload.
+Use the clean-smoke result only as an operational datapoint, not as a hardware
+guarantee.
 
-    ./scripts/install_hy3.sh --dry-run --no-build --no-pull
+Run the smoke test only when the endpoint is available for a test request:
 
-Install or reconcile the active deployment using automatic qualification:
+```bash
+HY3_ENDPOINT_URL=http://127.0.0.1:11453 \
+HY3_MODEL=/srv/hy3/hy3-1M-Q2_K.gguf \
+HY3_EXPECTED_CTX=262000 \
+./scripts/test_hy3_endpoint.sh
+```
 
-    ./scripts/install_hy3.sh --enable-linger
+The test checks health, model metadata, context reporting, an
+OpenAI-compatible completion, token usage, timing, and GPU process residency.
+It can take several minutes when another Omnius request is using the only
+slot. A health-only check does not generate tokens:
 
-The installer writes host-specific state outside the repository:
+```bash
+curl -fsS http://127.0.0.1:11453/health
+```
 
-- $XDG_STATE_HOME/hy3/capabilities.json
-- $XDG_STATE_HOME/hy3/capabilities.md
-- $XDG_STATE_HOME/hy3/nvidia-topology.txt
-- $XDG_STATE_HOME/hy3/install.manifest
-- $XDG_STATE_HOME/hy3/profile.env
-- $XDG_STATE_HOME/hy3/profile.json
+## Omnius and API usage
 
-Useful overrides:
+The Hy3 endpoint is OpenAI-compatible. Configure Omnius to use:
 
-    ./scripts/install_hy3.sh --class MTP-IQ2_M --qualification full-gpu
-    ./scripts/install_hy3.sh --tier quality --upgrade
-    ./scripts/install_hy3.sh --qualification hybrid --class auto
-    ./scripts/install_hy3.sh --hf-repo satgeze/Hy3-1M-GGUF
-    ./scripts/install_hy3.sh --context 131072
-    ./scripts/install_hy3.sh --no-system-packages --no-build --no-pull
-    ./scripts/install_hy3.sh --install-nccl --require-nccl
+```text
+backend URL: http://127.0.0.1:11453
+model: /srv/hy3/hy3-1M-Q2_K.gguf
+context: 262144 or lower
+```
 
-NCCL is not required for the default layer-split service. It is required only
-when selecting a tensor-parallel profile; if the host package repository does
-not provide libnccl-dev, install the matching NVIDIA CUDA repository package
-before using --require-nccl. The installer never treats the CMake option being
-enabled as proof that NCCL was actually found.
+The exact Omnius backend adapter remains an Omnius-side setting. Existing
+deployments use the vLLM-compatible adapter pointed at this URL; this repo
+does not modify Omnius project state or create task folders.
 
-The generated service gives a live request up to five minutes to drain during
-an intentional restart. This prevents a long Omnius request from being
-SIGKILLed merely because the model is still finishing a completion.
+Direct completion example:
+
+```bash
+curl -fsS http://127.0.0.1:11453/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/srv/hy3/hy3-1M-Q2_K.gguf",
+    "messages": [{"role": "user", "content": "Return 2 + 2 as JSON."}],
+    "temperature": 0,
+    "max_tokens": 32
+  }' | jq
+```
+
+Thinking/reasoning is a request/template policy, not a global switch in the
+systemd service. Configure it explicitly in the Omnius request or project
+settings when required.
+
+## Service operations and diagnostics
+
+```bash
+systemctl --user status hy3-llama-live.service --no-pager
+systemctl --user is-active hy3-llama-live.service
+journalctl --user -u hy3-llama-live.service -f
+ss -ltnp | rg ':11453'
+curl -fsS http://127.0.0.1:11453/health
+curl -fsS http://127.0.0.1:11453/v1/models | jq
+```
+
+GPU and topology checks:
+
+```bash
+nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+nvidia-smi topo -m
+```
+
+If only one A100 is active, check the generated environment and service
+journal before changing model parameters:
+
+```bash
+cat "$HOME/.config/hy3/hy3-llama-live-llama.env"
+journalctl --user -u hy3-llama-live.service -b --no-pager \
+  | rg -i 'cuda|gpu|layer|offload|cpu|fit|unified|flash|memory|error'
+```
+
+The expected production profile contains:
+
+```text
+CUDA_VISIBLE_DEVICES=0,1,2
+--device CUDA0,CUDA1,CUDA2
+--split-mode layer
+--tensor-split 1,1,1
+--n-gpu-layers all
+--fit off
+--cpu-moe off
+--flash-attn on
+--cache-type-k q8_0
+--cache-type-v q8_0
+--parallel 1
+```
+
+Do not enable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` for a throughput target.
+Unified memory can prevent an out-of-memory failure by spilling weights into
+host RAM, but it recreates the CPU bottleneck this deployment is designed to
+avoid. Do not use `CPU_MOE=1` for the full-GPU profile.
+
+## Build details
+
+The build helper uses the custom Hy3 branch and configures the server for the
+reference A100 architecture:
+
+```bash
+./scripts/build_llama_cpp_hy3.sh
+
+# Fetch the current custom branch before building.
+UPDATE_SOURCE=1 ./scripts/build_llama_cpp_hy3.sh
+```
+
+Relevant build requirements:
+
+```text
+GGML_CUDA=ON
+GGML_CUDA_NCCL=ON
+GGML_CUDA_FA_ALL_QUANTS=ON
+GGML_CUDA_GRAPHS=ON
+CUDA architecture 80
+Release build
+targets: llama-server, llama-bench
+```
+
+The build helper verifies the CMake cache and reports whether NCCL was
+actually found. Setting `GGML_CUDA_NCCL=ON` alone is not treated as proof
+that NCCL is installed. Use `--require-nccl` in the installer to fail closed.
+
+## Repository layout
+
+```text
+configs/hy3-a100-hybrid.env          Shared serving defaults
+templates/llama-isolated-service.tpl Systemd unit template
+run_hy3_entrypoint.sh                Foreground/manual service entrypoint
+scripts/probe_hy3_host.sh            Capability and topology inventory
+scripts/resolve_hy3_profile.sh       Model/tier/qualification resolver
+scripts/install_hy3.sh                Supported end-to-end installer
+scripts/build_llama_cpp_hy3.sh       CUDA/NCCL llama.cpp build
+scripts/pull_hy3_gguf.sh              Hugging Face GGUF download helper
+scripts/generate_hy3_llama_service.sh User systemd unit generator
+scripts/test_hy3_endpoint.sh          API/context/GPU smoke test
+scripts/deploy_hy3_llama_isolated.sh  Lower-level legacy deployment helper
+deploy_hy3.sh                         Separate official Ollama helper
+```
+
+The recommended path is `scripts/install_hy3.sh`. Use the lower-level scripts
+when debugging or intentionally composing a deployment outside the automatic
+qualification flow.
