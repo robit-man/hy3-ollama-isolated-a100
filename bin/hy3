@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Operator console for the Hy3 user service. It is intentionally separate from
+# the installer: starting, stopping, and restarting remain explicit actions.
+set -Eeuo pipefail
+
+readonly DEFAULT_SERVICE_NAME="hy3-llama-live"
+readonly DEFAULT_HOST="127.0.0.1"
+readonly DEFAULT_PORT="11453"
+
+SYSTEMCTL_BIN="${HY3_SYSTEMCTL_BIN:-systemctl}"
+CURL_BIN="${HY3_CURL_BIN:-curl}"
+JOURNALCTL_BIN="${HY3_JOURNALCTL_BIN:-journalctl}"
+NVIDIA_SMI_BIN="${HY3_NVIDIA_SMI_BIN:-nvidia-smi}"
+EDITOR_BIN="${EDITOR:-vi}"
+READY_TIMEOUT_SEC="${HY3_READY_TIMEOUT_SEC:-240}"
+
+SERVICE_NAME="${HY3_SERVICE_NAME:-$DEFAULT_SERVICE_NAME}"
+SERVICE_NAME="${SERVICE_NAME%.service}"
+CONFIG_FILE="${HY3_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/hy3/${SERVICE_NAME}-llama.env}"
+
+die() {
+  printf 'hy3: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+validate_service_name() {
+  [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9@_.-]+$ ]] || die "invalid HY3_SERVICE_NAME: $SERVICE_NAME"
+}
+
+service_unit() {
+  printf '%s.service' "$SERVICE_NAME"
+}
+
+config_value() {
+  local key="$1"
+  [[ -r "$CONFIG_FILE" ]] || return 0
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); sub(/\r$/, ""); print; exit }' "$CONFIG_FILE"
+}
+
+endpoint_url() {
+  if [[ -n "${HY3_ENDPOINT:-}" ]]; then
+    printf '%s' "${HY3_ENDPOINT%/}"
+    return
+  fi
+  local host port
+  host="$(config_value HOST)"
+  port="$(config_value PORT)"
+  printf 'http://%s:%s' "${host:-$DEFAULT_HOST}" "${port:-$DEFAULT_PORT}"
+}
+
+model_path() {
+  local value
+  value="$(config_value MODEL_PATH)"
+  printf '%s' "${value:-unknown}"
+}
+
+is_active() {
+  "$SYSTEMCTL_BIN" --user is-active --quiet "$(service_unit)"
+}
+
+is_enabled() {
+  "$SYSTEMCTL_BIN" --user is-enabled --quiet "$(service_unit)"
+}
+
+is_healthy() {
+  "$CURL_BIN" -fsS --max-time 3 "$(endpoint_url)/health" >/dev/null 2>&1
+}
+
+wait_for_health() {
+  local started_at now
+  started_at="$(date +%s)"
+  printf 'Waiting for %s to serve %s' "$(service_unit)" "$(endpoint_url)"
+  while true; do
+    if is_healthy; then
+      printf '\nReady: %s\n' "$(endpoint_url)"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - started_at >= READY_TIMEOUT_SEC )); then
+      printf '\n' >&2
+      die "service did not become healthy within ${READY_TIMEOUT_SEC}s; inspect with: hy3 logs"
+    fi
+    printf '.'
+    sleep 1
+  done
+}
+
+wait_for_inactive() {
+  local timeout_sec="${1:-20}"
+  local started_at now
+  started_at="$(date +%s)"
+  while is_active; do
+    now="$(date +%s)"
+    if (( now - started_at >= timeout_sec )); then
+      die "service did not stop within ${timeout_sec}s"
+    fi
+    sleep 1
+  done
+}
+
+confirm() {
+  local action="$1"
+  if [[ "${HY3_ASSUME_YES:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    die "$action requires --yes outside the interactive console"
+  fi
+  local response
+  read -r -p "$action? [y/N] " response
+  [[ "$response" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+show_status() {
+  local active="inactive" enabled="disabled" health="unreachable" pid="-"
+  is_active && active="active"
+  is_enabled && enabled="enabled"
+  is_healthy && health="healthy"
+  pid="$($SYSTEMCTL_BIN --user show "$(service_unit)" --property MainPID --value 2>/dev/null || printf '0')"
+
+  printf 'Hy3 service: %s\n' "$(service_unit)"
+  printf 'State:       %s (%s)\n' "$active" "$enabled"
+  printf 'Endpoint:    %s (%s)\n' "$(endpoint_url)" "$health"
+  printf 'Main PID:    %s\n' "${pid:-0}"
+  printf 'Model:       %s\n' "$(model_path)"
+  printf 'Config:      %s\n' "$CONFIG_FILE"
+
+  if command -v "$NVIDIA_SMI_BIN" >/dev/null 2>&1; then
+    printf '\nGPU memory (MiB):\n'
+    "$NVIDIA_SMI_BIN" --query-gpu=index,name,memory.used,memory.free --format=csv,noheader,nounits 2>/dev/null || true
+    printf '\nHy3 GPU process:\n'
+    "$NVIDIA_SMI_BIN" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null \
+      | awk -v wanted="$pid" -F',' '$1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" { print }' || true
+  fi
+}
+
+load_service() {
+  confirm "Load $(service_unit) and reserve its configured GPU memory" || return 0
+  "$SYSTEMCTL_BIN" --user start "$(service_unit)"
+  wait_for_health
+}
+
+unload_service() {
+  confirm "Unload $(service_unit) and release its GPU memory" || return 0
+  "$SYSTEMCTL_BIN" --user stop "$(service_unit)"
+  wait_for_inactive 310
+  printf 'Unloaded: %s\n' "$(service_unit)"
+}
+
+restart_service() {
+  confirm "Restart $(service_unit); active model requests will be interrupted" || return 0
+  "$SYSTEMCTL_BIN" --user restart "$(service_unit)"
+  wait_for_health
+}
+
+kill_service() {
+  confirm "Force-kill $(service_unit); active model requests will be lost" || return 0
+  # Mark this as an operator-requested stop first, so Restart=on-failure does
+  # not immediately reload the model after SIGKILL.
+  "$SYSTEMCTL_BIN" --user stop --no-block "$(service_unit)"
+  "$SYSTEMCTL_BIN" --user kill --kill-who=all --signal=SIGKILL "$(service_unit)" || true
+  wait_for_inactive 20
+  printf 'Force-killed and unloaded: %s\n' "$(service_unit)"
+}
+
+show_logs() {
+  "$JOURNALCTL_BIN" --user -u "$(service_unit)" --no-pager -n 100
+}
+
+follow_logs() {
+  "$JOURNALCTL_BIN" --user -fu "$(service_unit)"
+}
+
+show_config() {
+  printf 'Service: %s\n' "$(service_unit)"
+  printf 'Config:  %s\n\n' "$CONFIG_FILE"
+  if [[ -r "$CONFIG_FILE" ]]; then
+    cat "$CONFIG_FILE"
+  else
+    printf 'Configuration file has not been generated. Run scripts/install_hy3.sh first.\n'
+  fi
+}
+
+edit_config() {
+  [[ -e "$CONFIG_FILE" ]] || die "configuration file does not exist: $CONFIG_FILE"
+  "$EDITOR_BIN" "$CONFIG_FILE"
+  printf 'Configuration saved. Restart the service to apply changes.\n'
+}
+
+pause() {
+  if [[ -t 0 ]]; then
+    read -r -p 'Press Enter to return to the Hy3 console...'
+  fi
+}
+
+text_menu() {
+  while true; do
+    printf '\nHy3 service console — %s\n' "$(service_unit)"
+    printf '1) Status\n2) Load service\n3) Unload service\n4) Restart service\n5) Force-kill service\n6) Recent logs\n7) Follow logs\n8) Show config\n9) Edit config\n0) Exit\n'
+    local choice
+    read -r -p 'Select an action: ' choice
+    case "$choice" in
+      1) show_status; pause ;;
+      2) load_service; pause ;;
+      3) unload_service; pause ;;
+      4) restart_service; pause ;;
+      5) kill_service; pause ;;
+      6) show_logs; pause ;;
+      7) follow_logs; pause ;;
+      8) show_config; pause ;;
+      9) edit_config; pause ;;
+      0) return 0 ;;
+      *) printf 'Unknown selection.\n' ;;
+    esac
+  done
+}
+
+whiptail_menu() {
+  while true; do
+    local choice
+    choice="$(whiptail --title "Hy3 service console" --menu "$(service_unit)\n$(endpoint_url)" 20 82 10 \
+      status 'Show service, endpoint, and GPU status' \
+      load 'Start and wait for the model endpoint' \
+      unload 'Gracefully stop and release GPU memory' \
+      restart 'Restart and wait for the model endpoint' \
+      kill 'Force-stop the service immediately' \
+      logs 'Show the latest 100 service log lines' \
+      follow 'Follow the service journal' \
+      config 'Show the generated service configuration' \
+      edit 'Edit the generated service configuration' \
+      exit 'Leave the console' 3>&1 1>&2 2>&3)" || return 0
+    case "$choice" in
+      status) clear; show_status; pause ;;
+      load) load_service; pause ;;
+      unload) unload_service; pause ;;
+      restart) restart_service; pause ;;
+      kill) kill_service; pause ;;
+      logs) clear; show_logs; pause ;;
+      follow) follow_logs; pause ;;
+      config) clear; show_config; pause ;;
+      edit) edit_config; pause ;;
+      exit) return 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'EOF'
+Usage: hy3 [command] [--yes]
+
+Without a command, open the interactive Hy3 service console.
+
+Commands:
+  status       Show service, endpoint, model, and GPU status.
+  load         Start the configured service and wait for /health.
+  unload       Gracefully stop the service and release its GPU memory.
+  restart      Restart the service and wait for /health.
+  kill         Force-stop the service and prevent automatic reload.
+  logs         Print the last 100 journal lines.
+  follow       Follow service logs.
+  config       Print the generated service configuration.
+  edit-config  Open the generated service configuration in $EDITOR.
+
+Destructive commands require a terminal confirmation or --yes.
+
+Configuration overrides:
+  HY3_SERVICE_NAME=hy3-llama-live  systemd user unit without .service
+  HY3_CONFIG_FILE=...              generated service environment file
+  HY3_ENDPOINT=http://host:port    health endpoint override
+  HY3_READY_TIMEOUT_SEC=240        startup health deadline
+EOF
+}
+
+main() {
+  validate_service_name
+  require_command "$SYSTEMCTL_BIN"
+  require_command "$CURL_BIN"
+
+  local command="${1:-menu}"
+  if [[ "$command" == "--help" || "$command" == "-h" || "$command" == "help" ]]; then
+    usage
+    return 0
+  fi
+  shift || true
+  if [[ "${1:-}" == "--yes" ]]; then
+    HY3_ASSUME_YES=1
+    shift
+  fi
+  [[ $# -eq 0 ]] || die "unexpected argument: $1"
+
+  case "$command" in
+    menu)
+      if [[ -t 0 && -t 1 ]] && command -v whiptail >/dev/null 2>&1; then
+        whiptail_menu
+      elif [[ -t 0 && -t 1 ]]; then
+        text_menu
+      else
+        usage
+      fi
+      ;;
+    status) show_status ;;
+    load) load_service ;;
+    unload) unload_service ;;
+    restart) restart_service ;;
+    kill) kill_service ;;
+    logs) show_logs ;;
+    follow) follow_logs ;;
+    config) show_config ;;
+    edit-config) edit_config ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

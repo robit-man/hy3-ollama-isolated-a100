@@ -37,6 +37,34 @@ systemctl --user status hy3-llama-live.service --no-pager
 
 Expected endpoint: `http://127.0.0.1:11453`.
 
+## Operator console
+
+The installer also puts `hy3` in `~/.local/bin`, so it is available from any
+terminal. Running it with no arguments opens an interactive console for the
+live `hy3-llama-live.service` unit:
+
+```bash
+hy3
+```
+
+The console shows the unit, endpoint health, model, and GPU allocation, and
+offers load, unload, restart, force-kill, log, and configuration actions. Each
+action that changes the service asks for confirmation. The same operations are
+available to scripts, with an explicit `--yes` acknowledgement:
+
+```bash
+hy3 status                 # read-only
+hy3 unload --yes           # gracefully release the model's GPU memory
+hy3 load --yes             # start and wait for /health
+hy3 restart --yes          # interrupt active requests and restart
+hy3 kill --yes             # force-stop; does not auto-reload
+hy3 logs
+```
+
+By default the console controls `hy3-llama-live.service` at `:11453`. To
+operate a separately generated Hy3 unit, set `HY3_SERVICE_NAME`; to point the
+health check elsewhere use `HY3_ENDPOINT`.
+
 For a fail-closed NCCL requirement, add `--require-nccl`. NCCL is not needed
 for the default layer-split service, but it is required for future
 tensor-parallel experiments. The installer uses `sudo` only for apt packages

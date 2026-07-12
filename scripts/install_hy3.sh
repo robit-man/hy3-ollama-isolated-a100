@@ -275,6 +275,8 @@ HY3_CONFIG_FILE="$REPO_DIR/configs/hy3-a100-hybrid.env" \
   "$SCRIPT_DIR/generate_hy3_llama_service.sh" \
   "$SERVICE_NAME" "$PORT" "$HOST" "$MODEL_PATH" "$LLAMA_SERVER_BIN"
 
+"$SCRIPT_DIR/install_hy3_control.sh"
+
 if [[ "$ENABLE_LINGER" == "1" ]]; then
   command -v loginctl >/dev/null 2>&1 || die "loginctl is required for --enable-linger"
   log "enabling user lingering for $USER"
