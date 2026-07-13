@@ -31,7 +31,13 @@ EOF
 cat > "$TMP_DIR/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$HY3_TEST_CALLS"
-printf '{"status":"ok"}\n'
+case " $* " in
+  *"/health "*) printf '{"status":"ok","model_state":"unloaded"}\n' ;;
+  *"/_hy3/control/load "*) printf '{"status":"ok","model_state":"ready"}\n' ;;
+  *"/_hy3/control/unload "*) printf '{"status":"ok","model_state":"unloaded"}\n' ;;
+  *"/_hy3/control/kill "*) printf '{"status":"ok","model_state":"unloaded"}\n' ;;
+  *) printf '{"status":"ok"}\n' ;;
+esac
 EOF
 cat > "$TMP_DIR/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
@@ -57,12 +63,16 @@ printf '%s' "$status_output" | rg -q 'Endpoint:    http://127.0.0.1:11499'
 
 run load --yes >/dev/null
 rg -qx -- '--user start hy3-test.service' "$CALLS"
+rg -q -- '/_hy3/control/load' "$CALLS"
+
+run unload --yes >/dev/null
+rg -q -- '/_hy3/control/unload' "$CALLS"
 
 run restart --yes >/dev/null
 rg -qx -- '--user restart hy3-test.service' "$CALLS"
+[[ "$(rg -c '/_hy3/control/load' "$CALLS")" -ge 2 ]]
 
 run kill --yes >/dev/null
-rg -qx -- '--user stop --no-block hy3-test.service' "$CALLS"
-rg -qx -- '--user kill --kill-who=all --signal=SIGKILL hy3-test.service' "$CALLS"
+rg -q -- '/_hy3/control/kill' "$CALLS"
 
 printf 'Hy3 control tests passed.\n'

@@ -30,7 +30,7 @@ runs an API/GPU smoke test.
 Check the endpoint:
 
 ```bash
-curl -fsS http://127.0.0.1:11453/health
+# This starts the model if it is unloaded, then returns its metadata.
 curl -fsS http://127.0.0.1:11453/v1/models | jq '.data[0].meta | {n_ctx,n_ctx_train,ftype,size}'
 systemctl --user status hy3-llama-live.service --no-pager
 ```
@@ -54,14 +54,20 @@ available to scripts, with an explicit `--yes` acknowledgement:
 
 ```bash
 hy3 status                 # read-only
-hy3 unload --yes           # gracefully release the model's GPU memory
-hy3 load --yes             # start and wait for /health
+hy3 unload --yes           # gracefully release the model's GPU and host memory
+hy3 load --yes             # load the model now and wait for /health
 hy3 restart --yes          # interrupt active requests and restart
-hy3 kill --yes             # force-stop; does not auto-reload
+hy3 kill --yes             # force-unload; the next inference reloads it
 hy3 logs
 ```
 
-By default the console controls `hy3-llama-live.service` at `:11453`. To
+By default the console controls `hy3-llama-live.service` at `:11453`. The
+service is a lightweight loopback proxy: a normal non-health request loads
+the model automatically, active requests drain, and the model is unloaded
+with `SIGINT` after five idle minutes by default. `GET /health` reports 503
+with `model_state: unloaded` while memory is released and never reloads it.
+Set `HY3_IDLE_TIMEOUT_SEC` in the generated environment to change the idle
+period. To
 operate a separately generated Hy3 unit, set `HY3_SERVICE_NAME`; to point the
 health check elsewhere use `HY3_ENDPOINT`.
 
@@ -80,7 +86,7 @@ Face catalog changes.
 
 | Item | Observed value |
 | --- | --- |
-| Service | `hy3-llama-live.service`, active |
+| Service | `hy3-llama-live.service`, on-demand proxy active |
 | Endpoint | `127.0.0.1:11453` |
 | Model | `/srv/hy3/hy3-1M-Q2_K.gguf` |
 | Weight file | `111376119328` bytes |
@@ -100,7 +106,8 @@ Face catalog changes.
 | llama.cpp branch | `hy3-mtp` |
 | llama.cpp checkout observed | `56142c5f8` |
 
-The model process was observed holding approximately 52 GiB on each A100.
+When loaded, the model process holds approximately 52 GiB on each A100. The
+on-demand proxy releases that memory after the configured idle period.
 The host also contains a GeForce GT 1030 at CUDA index 3; it is intentionally
 excluded. The service uses physical A100 ids detected by the probe rather than
 assuming that every visible GPU is suitable.
@@ -219,8 +226,8 @@ service installer, not a root installer. It performs these checks and actions:
 7. Builds the custom branch with CUDA architecture 80, CUDA graphs, NCCL,
    and `GGML_CUDA_FA_ALL_QUANTS=ON`.
 8. Generates a user systemd service using the detected A100 ids.
-9. Restarts only the named service, waits for `/health`, and runs the smoke
-   test unless disabled.
+9. Restarts only the named proxy service, loads the model once for `/health`
+   and the smoke test unless disabled, then leaves idle unloading enabled.
 10. Writes a host-specific install manifest and profile decision.
 
 The default minimum is three A100s:
@@ -250,9 +257,9 @@ Useful installer options:
 ```
 
 The generated unit has a five-minute stop timeout so a long request can drain
-during an intentional restart. Do not restart the service during an Omnius
-task unless waiting up to five minutes for that request is acceptable. Use
-`--no-restart` to stage a profile safely and apply it later.
+during an intentional restart or idle unload. Do not restart the service
+during an Omnius task unless waiting up to five minutes for that request is
+acceptable. Use `--no-restart` to stage a profile safely and apply it later.
 
 Host-specific state is stored outside git:
 
@@ -297,7 +304,8 @@ memory and improve responsiveness. Do not increase `--parallel` while
 optimizing single-stream decode; the current service deliberately uses one
 slot so a 262K context is not divided among multiple slots.
 
-The endpoint's context metadata is available at:
+The endpoint's context metadata is available at (and automatically loads the
+model if it is idle):
 
 ```bash
 curl -fsS http://127.0.0.1:11453/v1/models | jq '.data[0].meta'
@@ -332,10 +340,10 @@ HY3_EXPECTED_CTX=262000 \
 ./scripts/test_hy3_endpoint.sh
 ```
 
-The test checks health, model metadata, context reporting, an
+The test loads the model on demand, then checks health, model metadata, context reporting, an
 OpenAI-compatible completion, token usage, timing, and GPU process residency.
 It can take several minutes when another Omnius request is using the only
-slot. A health-only check does not generate tokens:
+slot. A health-only check does not generate tokens or load an idle model:
 
 ```bash
 curl -fsS http://127.0.0.1:11453/health
@@ -382,6 +390,11 @@ ss -ltnp | rg ':11453'
 curl -fsS http://127.0.0.1:11453/health
 curl -fsS http://127.0.0.1:11453/v1/models | jq
 ```
+
+The first command returns `503` with an `unloaded` model state after the idle
+timeout; the second is a model request and reloads it automatically. The
+private llama-server backend listens on `HY3_BACKEND_PORT` (default `11454`)
+and must remain loopback-only.
 
 GPU and topology checks:
 

@@ -27,6 +27,12 @@ HY3_SERVICE_NAME="$SERVICE_NAME" \
 systemctl --user enable "$SERVICE_NAME.service" >/dev/null
 systemctl --user restart "$SERVICE_NAME.service"
 
+if ! curl -fsS --max-time "$READY_TIMEOUT_SEC" -X POST "http://${HOST}:${PORT}/_hy3/control/load" >/dev/null; then
+  echo "ERROR: on-demand proxy did not load the model in ${READY_TIMEOUT_SEC}s"
+  journalctl --user -u "$SERVICE_NAME.service" -n 120 --no-pager
+  exit 1
+fi
+
 echo "Waiting for endpoint on http://${HOST}:${PORT}/health"
 for _ in $(seq 1 "$READY_TIMEOUT_SEC"); do
   if curl -fsS --max-time 2 "http://${HOST}:${PORT}/health" >/dev/null 2>&1 &&

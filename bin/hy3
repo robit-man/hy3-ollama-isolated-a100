@@ -70,6 +70,21 @@ is_healthy() {
   "$CURL_BIN" -fsS --max-time 3 "$(endpoint_url)/health" >/dev/null 2>&1
 }
 
+control_url() {
+  printf '%s/_hy3/control/%s' "$(endpoint_url)" "$1"
+}
+
+control_action() {
+  local action="$1"
+  "$CURL_BIN" -fsS --max-time "$READY_TIMEOUT_SEC" -X POST "$(control_url "$action")"
+}
+
+is_unloaded() {
+  local status
+  status="$("$CURL_BIN" -sS --max-time 3 "$(endpoint_url)/health" 2>/dev/null || true)"
+  [[ "$status" == *'"model_state":"unloaded"'* ]]
+}
+
 wait_for_health() {
   local started_at now
   started_at="$(date +%s)"
@@ -141,30 +156,34 @@ show_status() {
 load_service() {
   confirm "Load $(service_unit) and reserve its configured GPU memory" || return 0
   "$SYSTEMCTL_BIN" --user start "$(service_unit)"
+  control_action load >/dev/null || die "could not load the Hy3 model through the on-demand proxy"
   wait_for_health
 }
 
 unload_service() {
-  confirm "Unload $(service_unit) and release its GPU memory" || return 0
-  "$SYSTEMCTL_BIN" --user stop "$(service_unit)"
-  wait_for_inactive 310
-  printf 'Unloaded: %s\n' "$(service_unit)"
+  confirm "Unload the Hy3 model and release its GPU memory" || return 0
+  control_action unload >/dev/null || die "could not unload the Hy3 model; it may still have an active request"
+  local started_at now
+  started_at="$(date +%s)"
+  while ! is_unloaded; do
+    now="$(date +%s)"
+    (( now - started_at < 20 )) || die "model did not report unloaded state within 20s"
+    sleep 1
+  done
+  printf 'Unloaded model; proxy remains ready for the next request: %s\n' "$(service_unit)"
 }
 
 restart_service() {
   confirm "Restart $(service_unit); active model requests will be interrupted" || return 0
   "$SYSTEMCTL_BIN" --user restart "$(service_unit)"
+  control_action load >/dev/null || die "could not reload the Hy3 model through the on-demand proxy"
   wait_for_health
 }
 
 kill_service() {
-  confirm "Force-kill $(service_unit); active model requests will be lost" || return 0
-  # Mark this as an operator-requested stop first, so Restart=on-failure does
-  # not immediately reload the model after SIGKILL.
-  "$SYSTEMCTL_BIN" --user stop --no-block "$(service_unit)"
-  "$SYSTEMCTL_BIN" --user kill --kill-who=all --signal=SIGKILL "$(service_unit)" || true
-  wait_for_inactive 20
-  printf 'Force-killed and unloaded: %s\n' "$(service_unit)"
+  confirm "Force-unload the Hy3 model; active model requests will be lost" || return 0
+  control_action kill >/dev/null || die "could not force-unload the Hy3 model"
+  printf 'Force-unloaded model; the next inference request will reload it: %s\n' "$(service_unit)"
 }
 
 show_logs() {
@@ -256,10 +275,10 @@ Without a command, open the interactive Hy3 service console.
 
 Commands:
   status       Show service, endpoint, model, and GPU status.
-  load         Start the configured service and wait for /health.
-  unload       Gracefully stop the service and release its GPU memory.
-  restart      Restart the service and wait for /health.
-  kill         Force-stop the service and prevent automatic reload.
+  load         Start the proxy, load the model, and wait for /health.
+  unload       Gracefully unload the model and release GPU/host memory.
+  restart      Restart the proxy, reload the model, and wait for /health.
+  kill         Force-unload the model and interrupt active requests.
   logs         Print the last 100 journal lines.
   follow       Follow service logs.
   config       Print the generated service configuration.

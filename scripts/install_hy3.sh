@@ -287,6 +287,9 @@ if [[ "$SKIP_RESTART" != "1" ]]; then
   log "enabling and restarting $SERVICE_NAME.service"
   systemctl --user enable "$SERVICE_NAME.service" >/dev/null
   systemctl --user restart "$SERVICE_NAME.service"
+  log "loading Hy3 through the on-demand endpoint"
+  curl -fsS --max-time "$READY_TIMEOUT_SEC" -X POST "http://$HOST:$PORT/_hy3/control/load" >/dev/null \
+    || die "on-demand proxy could not load the Hy3 model; inspect journalctl --user -u $SERVICE_NAME.service"
   healthy=0
   for _ in $(seq 1 "$READY_TIMEOUT_SEC"); do
     if curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then

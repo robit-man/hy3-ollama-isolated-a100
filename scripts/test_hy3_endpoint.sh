@@ -5,6 +5,7 @@ ENDPOINT="${HY3_ENDPOINT_URL:-http://127.0.0.1:11453}"
 MODEL="${HY3_MODEL:-/srv/hy3/hy3-1M-Q2_K.gguf}"
 EXPECTED_CTX="${HY3_EXPECTED_CTX:-262000}"
 MAX_TOKENS="${HY3_MAX_TOKENS:-48}"
+LOAD_TIMEOUT_SEC="${HY3_LOAD_TIMEOUT_SEC:-600}"
 TMP_RESPONSE="$(mktemp)"
 trap 'rm -f "$TMP_RESPONSE"' EXIT
 
@@ -13,13 +14,14 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "Loading on demand and checking ${ENDPOINT}/v1/models"
+models="$(curl -fsS --max-time "$LOAD_TIMEOUT_SEC" "${ENDPOINT}/v1/models")"
+echo "Model metadata:"
+echo "$models" | jq -c '.data[0] // .'
+
 echo "Checking ${ENDPOINT}/health"
 health="$(curl -fsS --max-time 10 "${ENDPOINT}/health")"
 echo "$health"
-
-models="$(curl -fsS --max-time 20 "${ENDPOINT}/v1/models")"
-echo "Model metadata:"
-echo "$models" | jq -c '.data[0] // .'
 
 reported_ctx="$(echo "$models" | jq -r '.data[0].meta.n_ctx // .data[0].meta.n_ctx_train // .data[0].context_length // empty')"
 if [[ -z "$reported_ctx" || "$reported_ctx" == "null" ]]; then
